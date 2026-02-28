@@ -4,10 +4,14 @@ TCP/UDP echo client boilerplate.
 """
 import argparse
 import json
+import os
 import time
 import socket
 import threading
-from typing import List
+import struct
+from typing import List, Dict, Tuple
+import csv
+
 
 ##### helper functions #####
 def now_wall() -> float:
@@ -20,7 +24,7 @@ def log_event(fp, event: dict):
     fp.write(json.dumps(event, sort_keys=True) + "\n")
     fp.flush()
 
-def recv_exact(conn: socket.socket, n: int) -> bytes:
+def recv_exact_tcp(conn: socket.socket, n: int) -> bytes:
     """Receive exactly n bytes from a TCP stream (or b'' if the server closes)."""
     buf = bytearray()
     while len(buf) < n:
@@ -30,59 +34,228 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
         buf.extend(chunk)
     return bytes(buf)
 
-##### Required functions to implement. Do not change signatures. #####
-def run_tcp_client(host: str, port: int, log_path: str,
-                   payload_bytes: int, requests: int, clients: int) -> None:
-    """Run the TCP client benchmark."""
-    payload = b"x" * payload_bytes
 
-    lock = threading.Lock()
-    all_rtts: List[float] = []
-    all_conn_setup: List[float] = []
-    errors: List[str] = []
+HDR = struct.Struct("!II")  # cid, seq
+def udp_receiver(udp_sock: socket.socket,
+                 payload_bytes: int,
+                 expected_replies: int,
+                 stop_event: threading.Event) -> List[Tuple[int, int, float]]:
+    """
+    Receives UDP echoes on the shared socket and records receive timestamps.
+    Returns list of tuples: (cid, seq, recv_time_mono)
+    """
+    recv_ts: List[Tuple[int, int, float]] = []
+    idle_timeouts_after_stop = 0
 
-    def client_worker(client_id: int):
-        nonlocal all_rtts, all_conn_setup, errors
+    while True:
+        # Stop condition 1: got everything we expect
+        if len(recv_ts) >= expected_replies:
+            break
 
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                # Measure TCP connection setup time (handshake)
-                t0 = now_mono()
-                s.connect((host, port))
-                t1 = now_mono()
-                conn_setup = t1 - t0
+            data, _ = udp_sock.recvfrom(payload_bytes + 1024)
+        except socket.timeout:
+            if stop_event.is_set():
+                idle_timeouts_after_stop += 1
+                if idle_timeouts_after_stop >= 5:  # ~1s if timeout is 0.2
+                    break
+            continue
+        except OSError:
+            break
 
-                local_rtts: List[float] = []
+        if len(data) < HDR.size:
+            continue
+        if len(data) != payload_bytes:
+            continue
 
-                for req_i in range(requests):
-                    start = now_mono()
-                    s.sendall(payload)
+        cid, seq = HDR.unpack_from(data, 0)
+        recv_ts.append((cid, seq, now_mono()))
 
-                    echoed = recv_exact(s, payload_bytes)
-                    end = now_mono()
+    return recv_ts
 
-                    if not echoed:
-                        raise RuntimeError("Server closed connection early.")
-                    if len(echoed) != payload_bytes:
-                        raise RuntimeError(f"Expected {payload_bytes} bytes, got {len(echoed)} bytes.")
+def udp_worker(client_id: int,
+               host: str,
+               port: int,
+               payload_bytes: int,
+               requests: int,
+               udp_sock: socket.socket,
+               send_tup: List[Tuple[int, int, float]],
+               send_tup_lock: threading.Lock) -> None:
+    if payload_bytes < HDR.size:
+        raise ValueError(f"payload_bytes must be >= {HDR.size}")
 
-                    local_rtts.append(end - start)
+    filler = b"u" * (payload_bytes - HDR.size)
+    local_send_tup: List[Tuple[int, int, float]] = []
 
-                with lock:
-                    all_conn_setup.append(conn_setup)
-                    all_rtts.extend(local_rtts)
+    for seq in range(requests):
+        payload = HDR.pack(client_id, seq) + filler
+        send_time = now_mono()
+        udp_sock.sendto(payload, (host, port))
+        local_send_tup.append((client_id, seq, send_time))
 
-        except Exception as e:
+    # publish this worker's sends
+    with send_tup_lock:
+        send_tup.extend(local_send_tup)
+
+def run_udp_client(host: str, port: int, log_path: str,
+                   payload_bytes: int, requests: int, clients: int) -> None:
+    """
+    Run UDP client benchmark using ONE shared UDP socket
+    Produces two CSVs:
+      - <log_path>_sent.csv : cid, seq, send_time_mono
+      - <log_path>_recv.csv : cid, seq, recv_time_mono
+    """
+    expected_replies = clients * requests
+
+    # Global list of per-worker send tup
+    send_tup: List[Tuple[int, int, float]] = []
+    send_tup_lock = threading.Lock()
+
+    stop_event = threading.Event()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+
+        udp_sock.settimeout(0.2)  # lets receiver check stop_event
+
+        # Receiver thread returns a list of tuples: (cid, seq, recv_time_mono)
+        recv_holder = [None]  # mutable holder for receiver result since threads can't return
+
+        def receiver_runner():
+            recv_holder[0] = udp_receiver(
+                udp_sock=udp_sock,
+                payload_bytes=payload_bytes,
+                expected_replies=expected_replies,
+                stop_event=stop_event
+            )
+
+        recv_thread = threading.Thread(target=receiver_runner, daemon=True)
+        recv_thread.start()
+
+        wall_start = now_wall()
+        mono_start = now_mono()
+
+        # Start workers
+        threads = []
+        for cid in range(clients):
+            t = threading.Thread(
+                target=udp_worker,
+                args=(cid, host, port, payload_bytes, requests,
+                      udp_sock, send_tup, send_tup_lock),
+                daemon=True
+            )
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        # tell receiver we're done sending (it may still be receiving late replies)
+        stop_event.set()
+        recv_thread.join()
+
+        mono_end = now_mono()
+        wall_end = now_wall()
+        elapsed = mono_end - mono_start
+
+    recv_ts: List[Tuple[int, int, float]] = recv_holder[0] or []
+
+    last_recv_time = max((ts for _, _, ts in recv_ts), default=0)
+    # output file names
+
+    os.makedirs(log_path, exist_ok=True)
+    sent_csv = os.path.join(log_path, f"udp_sent_c{clients}_r{requests}_p{payload_bytes}.csv")
+    recv_csv = os.path.join(log_path, f"udp_recv_c{clients}_r{requests}_p{payload_bytes}.csv")
+    jsonmeta = os.path.join(log_path, f"udp_meta_c{clients}_r{requests}_p{payload_bytes}.jsonl")
+
+    # Write CSV: sent
+    with open(sent_csv, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["cid", "seq", "send_time_mono"])
+        for cid, seq, ts in send_tup:
+            w.writerow([cid, seq, ts])
+
+    # Write CSV: recv
+    with open(recv_csv, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["cid", "seq", "recv_time_mono"])
+        for cid, seq, ts in recv_ts:
+            w.writerow([cid, seq, ts])
+
+    # Write JSON metadata 
+    with open(jsonmeta, "w") as fp:
+        log_event(fp, {
+            "event": "client_run",
+            "proto": "udp",
+            "host": host,
+            "port": port,
+            "payload_bytes": payload_bytes,
+            "requests": requests,
+            "clients": clients,
+            "expected_replies": expected_replies,
+            "start_ts": wall_start,
+            "end_ts": wall_end,
+            "elapsed_s": elapsed,
+            "lost_replies": expected_replies - len(recv_ts),
+            "last_recv_package_ts": last_recv_time
+        })
+
+
+
+
+def tcp_client_worker(client_id: int, con_info: tuple, lock: threading.Lock, all_rtts: List[Tuple[int, int, float]], all_conn_setup: List[Tuple[int, float]], errors: List[str]) -> None:
+
+    host, port, requests, payload_bytes = con_info
+    payload = b"x" * payload_bytes
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+
+            # Measure TCP connection setup
+            t0 = now_mono()
+            s.connect((host, port))
+            t1 = now_mono()
+            conn_setup = t1 - t0
+
+            local_rtts: List[Tuple[int, int, float]] = []
+
+            for req_i in range(requests):
+                
+                start = now_mono()
+                s.sendall(payload)
+                echoed = recv_exact_tcp(s, payload_bytes)
+                end = now_mono()
+
+                if not echoed:
+                    raise RuntimeError("Server closed connection early.")
+                if len(echoed) != payload_bytes:
+                    raise RuntimeError("Incorrect payload size.")
+
+                local_rtts.append((client_id, req_i, end - start))
+
             with lock:
-                errors.append(f"client_id={client_id}: {repr(e)}")
+                all_conn_setup.append((client_id, conn_setup))
+                all_rtts.extend(local_rtts)
 
-    # Start overall timer for throughput and time-to-finish
+    except Exception as e:
+        with lock:
+            errors.append(f"client_id={client_id}: {repr(e)}")
+
+
+def run_tcp_client(host: str, port: int, log_path: str,
+                   payload_bytes: int, requests: int, clients: int) -> None:
+    
+    """Run the TCP client benchmark (CSV data + JSON metadata)."""
+    lock = threading.Lock()
+    all_rtts: List[Tuple[int, int, float]] = []      # (cid, req_i, rtt)
+    all_conn_setup: List[Tuple[int, float]] = []     # (cid, conn_setup)
+    errors: List[str] = []
+
+    conn_info = (host, port, requests, payload_bytes)  # reuse this tuple to avoid passing many args to worker
+    # Run timing window
     wall_start = now_wall()
     mono_start = now_mono()
 
     threads = []
     for cid in range(clients):
-        t = threading.Thread(target=client_worker, args=(cid,), daemon=True)
+        t = threading.Thread(target=tcp_client_worker, args=(cid, conn_info, lock, all_rtts, all_conn_setup, errors), daemon=True)
         t.start()
         threads.append(t)
 
@@ -91,61 +264,46 @@ def run_tcp_client(host: str, port: int, log_path: str,
 
     mono_end = now_mono()
     wall_end = now_wall()
-
     elapsed = mono_end - mono_start
 
-    # Compute throughput 
-    total_requests_completed = len(all_rtts)
-    total_bytes = total_requests_completed * payload_bytes * 2
-    throughput_Bps = total_bytes / elapsed if elapsed > 0 else 0.0
+    os.makedirs(log_path, exist_ok=True)
+    # output file names
+    rtt_csv = os.path.join(log_path, f"tcp_rtt_c{clients}_r{requests}_p{payload_bytes}.csv")
+    conn_csv = os.path.join(log_path, f"tcp_conn_c{clients}_r{requests}_p{payload_bytes}.csv")
+    jsonmeta = os.path.join(log_path, f"tcp_meta_c{clients}_r{requests}_p{payload_bytes}.jsonl")
 
-    # Write logs
-    with open(log_path, "w") as fp:
+    # Write RTT CSV 
+    with open(rtt_csv, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["client_id", "request_index", "rtt_s"])
+        for row in all_rtts:
+            w.writerow(row)
 
+    # Write connection setup CSV 
+    with open(conn_csv, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["client_id", "conn_setup_s"])
+        for row in all_conn_setup:
+            w.writerow(row)
+
+    # Write JSON metadata
+    with open(jsonmeta, "w") as fp:
         log_event(fp, {
-            "event": "run_start",
+            "event": "client_run",
             "proto": "tcp",
             "host": host,
             "port": port,
-            "payload_bytes": payload_bytes,
-            "requests": requests,
             "clients": clients,
-            "ts": wall_start
-        })
-
-        # Per-request RTT logs 
-        for rtt in all_rtts:
-            log_event(fp, {
-                "event": "rtt",
-                "proto": "tcp",
-                "payload_bytes": payload_bytes,
-                "rtt_s": rtt
-            })
-
-        # Connection setup logs
-        for cs in all_conn_setup:
-            log_event(fp, {
-                "event": "conn_setup",
-                "proto": "tcp",
-                "conn_setup_s": cs
-            })
-
-        # Summary
-        log_event(fp, {
-            "event": "run_end",
-            "proto": "tcp",
-            "elapsed_s": elapsed,
-            "total_requests_completed": total_requests_completed,
-            "total_bytes": total_bytes,
-            "throughput_Bps": throughput_Bps,
+            "requests": requests,
+            "payload_bytes": payload_bytes,
+            "start_ts": wall_start,
+            "end_ts": wall_end,
+            "elapsed": elapsed,
+            "total_requests": len(all_rtts),
             "errors": errors,
-            "ts": wall_end
+            
         })
 
-def run_udp_client(host: str, port: int, log_path: str,
-                   payload_bytes: int, requests: int, clients: int) -> None:
-    """Run the UDP client benchmark."""
-    pass
 
 def parse_args() -> argparse.Namespace:
     """Parse CLI args."""
