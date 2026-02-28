@@ -102,6 +102,7 @@ def run_udp_server(bind: str, port: int, log_path: str,
     """Run the UDP server benchmark."""
     #server start timestamp
     start_ts = now_wall()
+    echoed_count = 0
 
     # open UDP socket and bind
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
@@ -121,6 +122,7 @@ def run_udp_server(bind: str, port: int, log_path: str,
                 data, addr = server_socket.recvfrom(BUF_SIZE)
                 #echo back to client
                 server_socket.sendto(data, addr)
+                echoed_count += 1
 
         # Handle server shutdown on Ctrl+C
         except KeyboardInterrupt:
@@ -142,7 +144,8 @@ def run_udp_server(bind: str, port: int, log_path: str,
             "clients": clients,
             "server_start": start_ts,
             "server_end": finish_ts,
-            "elapsed": finish_ts - start_ts
+            "elapsed": finish_ts - start_ts,
+            "echoed_back": echoed_count
         })
 
 

@@ -39,7 +39,9 @@ HDR = struct.Struct("!II")  # cid, seq
 def udp_receiver(udp_sock: socket.socket,
                  payload_bytes: int,
                  expected_replies: int,
-                 stop_event: threading.Event) -> List[Tuple[int, int, float]]:
+                 stop_event: threading.Event,
+                 bad_l: int,
+                 bad_sm: int) -> List[Tuple[int, int, float]]:
     """
     Receives UDP echoes on the shared socket and records receive timestamps.
     Returns list of tuples: (cid, seq, recv_time_mono)
@@ -64,8 +66,10 @@ def udp_receiver(udp_sock: socket.socket,
             break
 
         if len(data) < HDR.size:
+            bad_sm += 1
             continue
         if len(data) != payload_bytes:
+            bad_l += 1
             continue
 
         cid, seq = HDR.unpack_from(data, 0)
@@ -123,12 +127,16 @@ def run_udp_client(host: str, port: int, log_path: str,
         # Receiver thread returns a list of tuples: (cid, seq, recv_time_mono)
         recv_holder = [None]  # mutable holder for receiver result since threads can't return
 
+        bad_len = 0
+        bad_small = 0
         def receiver_runner():
             recv_holder[0] = udp_receiver(
                 udp_sock=udp_sock,
                 payload_bytes=payload_bytes,
                 expected_replies=expected_replies,
-                stop_event=stop_event
+                stop_event=stop_event,
+                bad_l=bad_len,
+                bad_sm=bad_small
             )
 
         recv_thread = threading.Thread(target=receiver_runner, daemon=True)
@@ -199,7 +207,9 @@ def run_udp_client(host: str, port: int, log_path: str,
             "end_ts": wall_end,
             "elapsed_s": elapsed,
             "lost_replies": expected_replies - len(recv_ts),
-            "last_recv_package_ts": last_recv_time
+            "last_recv_package_ts": last_recv_time,
+            "bad_len": bad_len,
+            "bad_small": bad_small,
         })
 
 
