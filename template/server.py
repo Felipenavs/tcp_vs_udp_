@@ -105,7 +105,11 @@ def run_udp_server(bind: str, port: int, log_path: str,
 
     # open UDP socket and bind
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
+
+        BUF = 16 * 1024 * 1024
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUF)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUF)
         server_socket.bind((bind, port))
 
         print(f"[UDP] Server listening on {bind}:{port}")

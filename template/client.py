@@ -114,7 +114,11 @@ def run_udp_client(host: str, port: int, log_path: str,
     stop_event = threading.Event()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
 
+        BUF = 16 * 1024 * 1024
         udp_sock.settimeout(0.2)  # lets receiver check stop_event
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, BUF)
+        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BUF)
 
         # Receiver thread returns a list of tuples: (cid, seq, recv_time_mono)
         recv_holder = [None]  # mutable holder for receiver result since threads can't return
