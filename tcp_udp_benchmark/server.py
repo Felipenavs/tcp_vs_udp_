@@ -62,7 +62,7 @@ def run_tcp_server(bind: str, port: int, log_path: str,
         print(f"[TCP] Server listening on {bind}:{port}")
 
         threads = []
-        for _ in range(clients):
+        for _ in range(clients ):  
             conn, addr = server_socket.accept()
             t = threading.Thread(
                 target=handle_client_tcp,
@@ -80,7 +80,7 @@ def run_tcp_server(bind: str, port: int, log_path: str,
     finish_ts = now_wall()
 
     os.makedirs(log_path, exist_ok=True)
-    filename = os.path.join(log_path, f"tcp_server_c{clients}_r{requests}_p{payload_bytes}.jsonl")
+    filename = os.path.join(log_path, f"tcp_server_c{clients}_r{requests}_p{payload_bytes}.json")
     with open(filename, "w") as fp:
         log_event(fp, {
             "event": "server_run",
@@ -132,7 +132,7 @@ def run_udp_server(bind: str, port: int, log_path: str,
     finish_ts = now_wall()
     
     os.makedirs(log_path, exist_ok=True)
-    filename = os.path.join(log_path, f"udp_server_c{clients}_r{requests}_p{payload_bytes}.jsonl")
+    filename = os.path.join(log_path, f"udp_server_c{clients}_r{requests}_p{payload_bytes}.json")
     with open(filename, "w") as fp:
         log_event(fp, {
             "event": "server_run",

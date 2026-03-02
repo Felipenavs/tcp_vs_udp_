@@ -41,7 +41,8 @@ def udp_receiver(udp_sock: socket.socket,
                  expected_replies: int,
                  stop_event: threading.Event,
                  bad_l: int,
-                 bad_sm: int) -> List[Tuple[int, int, float]]:
+                 bad_sm: int,
+                 recvd: int) -> List[Tuple[int, int, float]]:
     """
     Receives UDP echoes on the shared socket and records receive timestamps.
     Returns list of tuples: (cid, seq, recv_time_mono)
@@ -56,6 +57,7 @@ def udp_receiver(udp_sock: socket.socket,
 
         try:
             data, _ = udp_sock.recvfrom(payload_bytes + 1024)
+            recvd += 1
         except socket.timeout:
             if stop_event.is_set():
                 idle_timeouts_after_stop += 1
@@ -114,7 +116,7 @@ def run_udp_client(host: str, port: int, log_path: str,
     # Global list of per-worker send tup
     send_tup: List[Tuple[int, int, float]] = []
     send_tup_lock = threading.Lock()
-
+    received = 0
     stop_event = threading.Event()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
 
@@ -136,7 +138,8 @@ def run_udp_client(host: str, port: int, log_path: str,
                 expected_replies=expected_replies,
                 stop_event=stop_event,
                 bad_l=bad_len,
-                bad_sm=bad_small
+                bad_sm=bad_small,
+                recvd=received,
             )
 
         recv_thread = threading.Thread(target=receiver_runner, daemon=True)
@@ -176,7 +179,7 @@ def run_udp_client(host: str, port: int, log_path: str,
     os.makedirs(log_path, exist_ok=True)
     sent_csv = os.path.join(log_path, f"udp_sent_c{clients}_r{requests}_p{payload_bytes}.csv")
     recv_csv = os.path.join(log_path, f"udp_recv_c{clients}_r{requests}_p{payload_bytes}.csv")
-    jsonmeta = os.path.join(log_path, f"udp_meta_c{clients}_r{requests}_p{payload_bytes}.jsonl")
+    jsonmeta = os.path.join(log_path, f"udp_meta_c{clients}_r{requests}_p{payload_bytes}.json")
 
     # Write CSV: sent
     with open(sent_csv, "w", newline="") as fp:
@@ -210,6 +213,7 @@ def run_udp_client(host: str, port: int, log_path: str,
             "last_recv_package_ts": last_recv_time,
             "bad_len": bad_len,
             "bad_small": bad_small,
+            "received": received,
         })
 
 
@@ -243,6 +247,7 @@ def tcp_client_worker(client_id: int, con_info: tuple, lock: threading.Lock, all
                     raise RuntimeError("Incorrect payload size.")
 
                 local_rtts.append((client_id, req_i, end - start))
+
 
             with lock:
                 all_conn_setup.append((client_id, conn_setup))
@@ -284,7 +289,7 @@ def run_tcp_client(host: str, port: int, log_path: str,
     # output file names
     rtt_csv = os.path.join(log_path, f"tcp_rtt_c{clients}_r{requests}_p{payload_bytes}.csv")
     conn_csv = os.path.join(log_path, f"tcp_conn_c{clients}_r{requests}_p{payload_bytes}.csv")
-    jsonmeta = os.path.join(log_path, f"tcp_meta_c{clients}_r{requests}_p{payload_bytes}.jsonl")
+    jsonmeta = os.path.join(log_path, f"tcp_meta_c{clients}_r{requests}_p{payload_bytes}.json")
 
     # Write RTT CSV 
     with open(rtt_csv, "w", newline="") as fp:
